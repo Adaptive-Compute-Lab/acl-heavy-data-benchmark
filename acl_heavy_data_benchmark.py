@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - exercised by environment gating
 LOG = logging.getLogger("acl_benchmark")
 CHECKPOINT_VERSION = 1
 PROVENANCE_VERSION = "1"
+ZERO_DIGEST = "00" * 32
 
 
 class BenchmarkError(RuntimeError): pass
@@ -121,6 +122,12 @@ def rolling_digest(previous: str, obj: Any) -> str:
     return hashlib.sha256(bytes.fromhex(previous) + canonical(obj)).hexdigest()
 
 
+def digest_records(records: list[dict[str, Any]], previous: str = ZERO_DIGEST) -> str:
+    for record in records:
+        previous = rolling_digest(previous, record)
+    return previous
+
+
 def transform(record: dict[str, Any], threshold: int) -> tuple[bool, dict[str, Any]]:
     value = int(record.get("value", 0)); accepted = value >= threshold
     out = dict(record); out["accepted"] = accepted; out["transform_version"] = 1
@@ -148,7 +155,7 @@ class Result:
 class Counters:
     def __init__(self) -> None:
         self.processed = self.accepted = self.rejected = self.batches = self.source_bytes = 0
-        self.digest = "00" * 32
+        self.digest = ZERO_DIGEST
         self.last_offset = self.last_line = 0
 
 
@@ -182,6 +189,55 @@ def require_arrow() -> None:
 
 
 def shard_path(out: Path, seq: int) -> Path: return out / f"shard-{seq:012d}.parquet"
+
+
+def parquet_metadata(path: Path) -> dict[str, str]:
+    md = pq.ParquetFile(path).schema_arrow.metadata or {}
+    return {k.decode(): v.decode() for k, v in md.items()}
+
+
+def logical_key(path: Path) -> tuple[int, int, int, str]:
+    md = parquet_metadata(path)
+    try:
+        return (int(md.get("source_start_offset", "-1")), int(md.get("first_batch_seq", md.get("batch_seq", "-1"))), int(md.get("source_end_offset", "-1")), path.name)
+    except ValueError as exc:
+        raise BenchmarkError(f"invalid provenance on {path}") from exc
+
+
+def write_staged_shard(out: Path, records: list[dict[str, Any]], batches: list[Batch], cfg: GovernanceConfig, global_digest: str) -> Path:
+    require_arrow()
+    if not records or not batches:
+        raise ValueError("cannot write an empty staged shard")
+    estimated = sum(len(canonical(r)) for r in records)
+    if len(records) > cfg.shard_rows or estimated > cfg.shard_bytes:
+        raise BenchmarkError("staging envelope exceeded before durable shard write")
+    first, last = batches[0], batches[-1]
+    name = f"shard-{first.seq:012d}-{last.seq:012d}.parquet"
+    final = out / name
+    file_digest = digest_records(records)
+    metadata = {
+        "provenance_version": PROVENANCE_VERSION,
+        "first_batch_seq": str(first.seq), "last_batch_seq": str(last.seq),
+        "source_start_offset": str(first.start_offset), "source_end_offset": str(last.end_offset),
+        "source_start_line": str(first.start_line), "source_end_line": str(last.end_line),
+        "record_count": str(len(records)), "processed_count": str(sum(len(b.records) for b in batches)),
+        "logical_sha256": file_digest, "global_digest_at_end": global_digest,
+        "config_fingerprint": cfg.fingerprint(), "active": "true", "topology": "active",
+        "source_shards": "",
+    }
+    if final.exists():
+        old = parquet_metadata(final)
+        if old.get("logical_sha256") != file_digest or old.get("source_end_offset") != str(last.end_offset):
+            raise BenchmarkError(f"conflicting durable shard {final}")
+        return final
+    table = pa.Table.from_pylist(records)
+    md = dict(table.schema.metadata or {}); md.update({k.encode(): v.encode() for k, v in metadata.items()}); table = table.replace_schema_metadata(md)
+    fd, tmp = tempfile.mkstemp(prefix=f".{final.name}.", dir=out); os.close(fd)
+    try:
+        pq.write_table(table, tmp, compression="zstd"); pq.ParquetFile(tmp); os.replace(tmp, final)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    return final
 
 
 def write_shard(out: Path, result: Result, cfg: GovernanceConfig, digest: str) -> Path:
@@ -219,13 +275,21 @@ def load_checkpoint(path: Path, cfg: GovernanceConfig, ident: dict[str, Any]) ->
 def recover_journal(out: Path) -> None:
     journal=out/"compaction.journal.json"
     if not journal.exists(): return
-    j=json.loads(journal.read_text()); dest=out/j["destination"]; sources=[out/x for x in j["sources"]]
-    if j["state"] == "verified" and dest.exists():
-        for s in sources:
-            if s.exists(): s.unlink()
-        journal.unlink(missing_ok=True)
-    elif j["state"] in ("prepared", "writing"):
-        (out/j["destination_tmp"]).unlink(missing_ok=True); journal.unlink(missing_ok=True)
+    j=json.loads(journal.read_text()); dest=out/j["destination"]; tmp=out/j["destination_tmp"]; sources=[out/x for x in j["sources"]]
+    valid = False
+    if dest.exists():
+        try:
+            md=parquet_metadata(dest); valid=md.get("source_shards", "").split(",") == j["sources"] and int(md.get("record_count", "-1")) >= 0 and md.get("logical_sha256")
+        except (OSError, ValueError, BenchmarkError): valid=False
+    if valid:
+        atomic_json(journal, {**j, "state":"verified", "verified":True})
+        for source in sources:
+            source.unlink(missing_ok=True)
+        journal.unlink(missing_ok=True); tmp.unlink(missing_ok=True)
+    elif j.get("state") == "verified":
+        raise BenchmarkError("verified compaction destination is missing or invalid")
+    else:
+        tmp.unlink(missing_ok=True); dest.unlink(missing_ok=True); journal.unlink(missing_ok=True)
 
 
 def run_benchmark(cfg: GovernanceConfig, *, interrupt_after: int | None = None, force_pause: bool=False) -> dict[str, Any]:
@@ -271,18 +335,44 @@ def run_benchmark(cfg: GovernanceConfig, *, interrupt_after: int | None = None, 
                 q.task_done()
         except BaseException as exc: errors.append(exc); stop.set(); rq.put(None)
     pt=threading.Thread(target=producer, daemon=True); workers=[threading.Thread(target=worker, daemon=True) for _ in range(cfg.workers)]; pt.start(); [t.start() for t in workers]; pending={}; ended=0; next_seq=start_seq; paused=False
+    staged_records: list[dict[str, Any]] = []; staged_batches: list[Batch] = []; staged_bytes = 0; logical_digest = c.digest; last_checkpoint_time = time.monotonic(); records_since_checkpoint = 0
+
+    def commit_staged() -> None:
+        nonlocal staged_records, staged_batches, staged_bytes, logical_digest, last_checkpoint_time, records_since_checkpoint
+        if not staged_batches:
+            return
+        if staged_records:
+            write_staged_shard(out, staged_records, staged_batches, cfg, logical_digest)
+        for batch in staged_batches:
+            c.processed += len(batch.records)
+        c.accepted += len(staged_records)
+        c.rejected += sum(len(batch.records) for batch in staged_batches) - len(staged_records)
+        c.batches += len(staged_batches); c.digest = logical_digest
+        c.last_offset = staged_batches[-1].end_offset; c.last_line = staged_batches[-1].end_line
+        atomic_json(cp_path, checkpoint_payload(cfg, ident, c))
+        staged_records = []; staged_batches = []; staged_bytes = 0
+        records_since_checkpoint = 0; last_checkpoint_time = time.monotonic()
     try:
         while ended < cfg.workers:
             item=rq.get()
             if item is None: ended+=1; continue
             pending[item.batch.seq]=item
             while next_seq in pending:
-                res=pending.pop(next_seq); c.processed += len(res.batch.records); c.accepted += len(res.accepted); c.rejected += res.rejected; c.batches += 1
-                for rec in res.accepted: c.digest=rolling_digest(c.digest,rec)
-                write_shard(out,res,cfg,c.digest); c.last_offset=res.batch.end_offset; c.last_line=res.batch.end_line; next_seq+=1
-                atomic_json(cp_path,checkpoint_payload(cfg,ident,c))
-                if interrupt_after is not None and c.processed >= interrupt_after: stop.set(); paused=True; raise KeyboardInterrupt
+                res=pending.pop(next_seq)
+                accepted_bytes = sum(len(canonical(r)) for r in res.accepted)
+                if any(len(canonical(r)) > cfg.shard_bytes for r in res.accepted):
+                    raise BenchmarkError("single accepted record exceeds shard_bytes")
+                if staged_records and (len(staged_records) + len(res.accepted) > cfg.shard_rows or staged_bytes + accepted_bytes > cfg.shard_bytes):
+                    commit_staged()
+                staged_batches.append(res.batch); staged_records.extend(res.accepted); staged_bytes += accepted_bytes
+                logical_digest = digest_records(res.accepted, logical_digest); records_since_checkpoint += len(res.batch.records); next_seq+=1
+                due = records_since_checkpoint >= cfg.checkpoint_every_records or time.monotonic() - last_checkpoint_time >= cfg.checkpoint_every_seconds
+                if due:
+                    commit_staged()
+                if interrupt_after is not None and c.processed + sum(len(b.records) for b in staged_batches) >= interrupt_after:
+                    commit_staged(); stop.set(); paused=True; raise KeyboardInterrupt
                 if force_pause and op.get("governed_pause"): paused=True; stop.set(); raise GovernancePause("disk watermark reached")
+        commit_staged()
         if errors: raise errors[0]
         if op.get("governed_pause"):
             paused = True
@@ -302,16 +392,15 @@ def make_metrics(c: Counters, op: dict[str,Any], started: float, cpu0: float, ou
 
 
 def active_files(out: Path) -> list[Path]:
-    superseded=set()
-    for p in out.glob("compact-*.parquet"):
-        try:
-            md=pq.ParquetFile(p).schema_arrow.metadata or {}; superseded.update(x for x in md.get(b"source_shards",b"").decode().split(",") if x)
-        except Exception: continue
-    return [p for p in out.glob("shard-*.parquet") if p.name not in superseded] + list(out.glob("compact-*.parquet"))
+    superseded=set(); compacted=[]
+    for p in sorted(out.glob("compact-*.parquet")):
+        md=parquet_metadata(p); superseded.update(x for x in md.get("source_shards", "").split(",") if x); compacted.append(p)
+    files=[p for p in out.glob("shard-*.parquet") if p.name not in superseded] + compacted
+    return sorted(files, key=logical_key)
 
 
 def compact_output(out: Path, target_rows: int) -> dict[str,Any]:
-    require_arrow(); recover_journal(out); sources=sorted(out.glob("shard-*.parquet")); groups=[]; cur=[]; rows=0
+    require_arrow(); recover_journal(out); sources=sorted(out.glob("shard-*.parquet"), key=logical_key); groups=[]; cur=[]; rows=0
     for p in sources:
         n=pq.ParquetFile(p).metadata.num_rows
         if cur and rows+n>target_rows: groups.append(cur); cur=[]; rows=0
@@ -322,22 +411,32 @@ def compact_output(out: Path, target_rows: int) -> dict[str,Any]:
         dest=out/f"compact-{idx:06d}.parquet"; journal=out/"compaction.journal.json"; tmp=out/f".{dest.name}.tmp"
         if dest.exists(): continue
         atomic_json(journal,{"version":1,"sources":[p.name for p in group],"destination":dest.name,"destination_tmp":tmp.name,"state":"writing","verified":False})
-        tables=[pq.read_table(p) for p in group]; table=pa.concat_tables(tables, promote_options="default") if len(tables)>1 else tables[0]; md=dict(table.schema.metadata or {}); md.update({b"compaction_version":b"1",b"source_shards":b",".join(p.name.encode() for p in group),b"record_count":str(table.num_rows).encode(),b"active":b"true"}); table=table.replace_schema_metadata(md); pq.write_table(table,tmp,compression="zstd"); pq.ParquetFile(tmp); os.replace(tmp,dest); atomic_json(journal,{"version":1,"sources":[p.name for p in group],"destination":dest.name,"destination_tmp":tmp.name,"state":"verified","verified":True});
+        tables=[pq.read_table(p) for p in group]; table=pa.concat_tables(tables, promote_options="default") if len(tables)>1 else tables[0]
+        first_md,last_md=parquet_metadata(group[0]),parquet_metadata(group[-1]); file_digest=digest_records(table.to_pylist())
+        md=dict(table.schema.metadata or {}); md.update({b"provenance_version":PROVENANCE_VERSION.encode(),b"compaction_version":b"1",b"topology":b"active",b"source_shards":b",".join(p.name.encode() for p in group),b"source_start_offset":first_md["source_start_offset"].encode(),b"source_end_offset":last_md["source_end_offset"].encode(),b"source_start_line":first_md["source_start_line"].encode(),b"source_end_line":last_md["source_end_line"].encode(),b"first_batch_seq":first_md.get("first_batch_seq",first_md.get("batch_seq","0")).encode(),b"last_batch_seq":last_md.get("last_batch_seq",last_md.get("batch_seq","0")).encode(),b"record_count":str(table.num_rows).encode(),b"logical_sha256":file_digest.encode(),b"active":b"true"}); table=table.replace_schema_metadata(md)
+        pq.write_table(table,tmp,compression="zstd"); pq.ParquetFile(tmp); os.replace(tmp,dest); atomic_json(journal,{"version":1,"sources":[p.name for p in group],"destination":dest.name,"destination_tmp":tmp.name,"state":"verified","verified":True});
         for p in group: p.unlink()
         journal.unlink(missing_ok=True); made+=1
     return {"groups":len(groups),"files_created":made,"rows":sum(pq.ParquetFile(p).metadata.num_rows for p in out.glob("compact-*.parquet"))}
 
 
 def verify_output(out: Path, cfg: GovernanceConfig | None=None) -> dict[str,Any]:
-    require_arrow(); cp=json.loads((out/"checkpoint.json").read_text()); files=active_files(out); seen=[]; rows=0; digest="00"*32
+    require_arrow(); recover_journal(out); cp=json.loads((out/"checkpoint.json").read_text()); files=active_files(out); seen=[]; rows=0; digest=ZERO_DIGEST
     for p in files:
-        pf=pq.ParquetFile(p); md={k.decode():v.decode() for k,v in (pf.schema_arrow.metadata or {}).items()};
-        if "record_count" not in md: raise BenchmarkError(f"missing metadata: {p}")
-        rows+=pf.metadata.num_rows; seen.append((md.get("source_start_offset"),md.get("source_end_offset")))
-        for batch in pf.iter_batches():
-            for rec in batch.to_pylist(): digest=rolling_digest(digest,rec)
+        pf=pq.ParquetFile(p); md=parquet_metadata(p)
+        required=("record_count","source_start_offset","source_end_offset","source_start_line","source_end_line","first_batch_seq","last_batch_seq","logical_sha256","provenance_version")
+        if any(k not in md for k in required): raise BenchmarkError(f"incomplete provenance metadata: {p}")
+        records=[]
+        for batch in pf.iter_batches(): records.extend(batch.to_pylist())
+        if len(records) != int(md["record_count"]): raise BenchmarkError(f"row metadata mismatch: {p}")
+        if digest_records(records) != md["logical_sha256"]: raise BenchmarkError(f"file logical digest mismatch: {p}")
+        rows+=len(records); seen.append((int(md["source_start_offset"]),int(md["source_end_offset"]),p.name))
+        digest=digest_records(records,digest)
+    seen.sort()
+    for before,current in zip(seen,seen[1:]):
+        if current[0] < before[1]: raise BenchmarkError(f"overlapping active logical ranges: {before[2]} and {current[2]}")
     if rows != cp["total_accepted_records"]: raise BenchmarkError(f"accepted row mismatch: {rows} != {cp['total_accepted_records']}")
-    if files and digest != cp["deterministic_digest"]: raise BenchmarkError("logical digest mismatch")
+    if digest != cp["deterministic_digest"]: raise BenchmarkError("logical digest mismatch")
     return {"valid":True,"active_files":len(files),"accepted_records":rows,"digest":digest,"checkpoint_state":cp["completion_state"]}
 
 

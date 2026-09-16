@@ -26,7 +26,7 @@ python acl_heavy_data_benchmark.py compact --output-dir out --target-rows 100000
 
 ## Durability and recovery
 
-Each bounded batch has a monotonically increasing sequence and exact source byte/line range. Workers may finish out of order, but commits are ordered. A shard is written to a same-directory temporary path, closed, reopened for validation, and atomically renamed. The checkpoint is written using flush, `fsync`, `os.replace`, and parent-directory fsync where supported. The invariant is `checkpoint_offset <= last fully durable output boundary`.
+Each bounded batch has a monotonically increasing sequence and exact source byte/line range. Workers may finish out of order, but commits are ordered. Accepted rows enter a staging envelope that flushes before either `shard_rows` or `shard_bytes` can be exceeded; a single oversized accepted row is rejected explicitly. A shard is written to a same-directory temporary path, closed, reopened for validation, and atomically renamed. The checkpoint is written using flush, `fsync`, `os.replace`, and parent-directory fsync where supported. The invariant is `checkpoint_offset <= last fully durable output boundary`.
 
 Resume validates the full input identity (resolved path, size, mtime, SHA-256) and configuration fingerprint, seeks directly to the saved byte offset, and restores sequence/counters/digest. Existing shards are reconciled by sequence and range. Completed runs are idempotent.
 
@@ -34,7 +34,7 @@ Before admission, disk free bytes and percentage are checked after subtracting t
 
 ## Parquet and compaction
 
-Output shards contain provenance metadata: source range, batch sequence, counts, logical digest, schema/provenance version, and config fingerprint. Compaction writes a journal before writing, validates the destination, atomically installs it, then deletes source shards. The journal makes destination-durable/source-cleanup crashes recoverable. Verification treats compacted sources as superseded and rejects count/digest/topology inconsistencies.
+Output shards contain provenance metadata: source range, batch sequence, counts, logical digest, schema/provenance version, and config fingerprint. The per-file logical digest is the order-sensitive rolling SHA-256 over canonical JSON rows in that file; the checkpoint digest is the same rolling construction across all accepted rows in source order. Neither digest uses Parquet bytes, compression, timestamps, or filesystem order. Compaction writes a journal before writing, validates the destination, atomically installs it, then deletes source shards. The journal makes destination-durable/source-cleanup crashes recoverable. Verification treats compacted sources as superseded and rejects count/digest/topology inconsistencies.
 
 ## Metrics and tests
 
